@@ -1,0 +1,276 @@
+// ==UserScript==
+// @name         Territorial.io Local Bots + Emoji Menu
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Locally change main menu labels to 🦆🥨🍓, auto-click Multiplayer, and show 20 local-only fake bots in the lobby/overlay (for your browser only). No server actions performed.
+// @match        https://territorial.io/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // CONFIG
+  const BOT_COUNT = 20;               // number of fake bots to show locally
+  const BOT_NAME = '🦆🥨🍓';           // name shown for each fake bot
+  const AUTO_CLICK_MULTIPLAYER = true;
+  const AUTO_CLICK_DELAY_MS = 1200;   // delay before auto-clicking multiplayer
+  const MENU_REPLACE_DELAY_MS = 400;  // delay to allow SPA to render main menu
+  const LOBBY_OBSERVE_TIMEOUT = 10000; // how long to look for an in-page lobby (ms)
+
+  // Utility: wait for predicate with timeout
+  function waitFor(predicate, interval = 200, timeout = 5000) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      (function poll() {
+        try {
+          const r = predicate();
+          if (r) return resolve(r);
+        } catch (e) { /* ignore */ }
+        if (Date.now() - start >= timeout) return reject(new Error('timed out'));
+        setTimeout(poll, interval);
+      })();
+    });
+  }
+
+  // Replace menu/button labels in main menu area with BOT_NAME
+  function replaceMenuLabels() {
+    // Heuristic selectors for common menu containers & buttons
+    const candidates = Array.from(document.querySelectorAll('nav, header, .menu, .main-menu, .menu-bar, .button, button, a'));
+    const changed = [];
+    candidates.forEach(el => {
+      // Skip elements with no text or that are form inputs
+      if (!el || !el.textContent) return;
+      const text = el.textContent.trim();
+      if (!text) return;
+      // Skip tiny numeric text or copyright
+      if (text.length > 60) return;
+      // Avoid changing links that look like external or very short UI ornaments
+      // Replace if element appears to be a menu item (heuristic: contains letters and isn't already emoji)
+      if (/[A-Za-z]/.test(text) && !/[\u{1F300}-\u{1F6FF}]/u.test(text)) {
+        try {
+          el.dataset._origText = el.dataset._origText || el.textContent;
+          el.textContent = BOT_NAME;
+          changed.push(el);
+        } catch (e) { /* ignore cross-origin etc */ }
+      }
+    });
+    return changed;
+  }
+
+  // Try to auto-click a button whose text includes "multiplayer"
+  function autoClickMultiplayerButton() {
+    if (!AUTO_CLICK_MULTIPLAYER) return false;
+    const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+    const candidate = buttons.find(b => {
+      const t = (b.textContent || '').toLowerCase();
+      return t.includes('multiplayer') || t.includes('multi-player') || t.includes('multijoueur') /* common alt lang */;
+    });
+    if (candidate) {
+      console.log('[local-bots] auto-clicking multiplayer button', candidate);
+      setTimeout(() => candidate.click(), AUTO_CLICK_DELAY_MS);
+      return true;
+    }
+    return false;
+  }
+
+  // Attempt to find an existing lobby player list container
+  function findLobbyPlayerList() {
+    // Heuristics: look for elements with "lobby" or "players" in class/id/text, or existing player item nodes
+    const all = Array.from(document.querySelectorAll('div, ul, section'));
+    // 1) Find element containing "Players" text
+    let el = all.find(e => (e.textContent || '').toLowerCase().includes('players') && (e.childElementCount > 0));
+    if (el) return el;
+    // 2) Find container with many children that look like player items (child has small text or avatar)
+    el = all.find(e => {
+      if (e.childElementCount < 2) return false;
+      const children = Array.from(e.children);
+      const score = children.reduce((s, c) => s + ((c.textContent || '').length < 60 ? 1 : 0), 0);
+      return score >= Math.min(3, e.childElementCount);
+    });
+    if (el) return el;
+    // 3) fallback: find nodes with 'lobby' in class or id
+    el = document.querySelector('[class*="lobby"], [id*="lobby"], [class*="player"], [id*="players"]');
+    return el || null;
+  }
+
+  // Insert fake players into an existing container (best-effort, non-destructive)
+  function injectFakePlayersInto(container, count, name) {
+    if (!container) return false;
+    // Try to mimic existing child structure:
+    const sampleChild = container.querySelector('*');
+    // If there is no meaningful sample, create list items
+    if (!sampleChild) {
+      const ul = document.createElement('ul');
+      ul.style.listStyle = 'none';
+      ul.style.padding = '0';
+      for (let i = 0; i < count; i++) {
+        const li = document.createElement('li');
+        li.textContent = name;
+        li.style.padding = '6px 10px';
+        li.style.borderBottom = '1px solid rgba(0,0,0,0.08)';
+        ul.appendChild(li);
+      }
+      container.appendChild(ul);
+      return true;
+    }
+
+    // If there are existing player items, clone the first child to keep style
+    const template = sampleChild.cloneNode(true);
+    // Clean contents
+    function setName(node, nm) {
+      // replace any text node content inside with nm
+      const textNodes = [];
+      (function walk(n) {
+        if (n.nodeType === Node.TEXT_NODE && n.textContent.trim()) textNodes.push(n);
+        n.childNodes && n.childNodes.forEach(walk);
+      })(node);
+      if (textNodes.length > 0) {
+        textNodes.forEach(t => t.textContent = nm);
+        return;
+      }
+      // Fallback: set innerText
+      node.innerText = nm;
+    }
+
+    // Append clones
+    for (let i = 0; i < count; i++) {
+      const node = template.cloneNode(true);
+      setName(node, name);
+      // Add an attribute so we can identify injected nodes later
+      node.setAttribute('data-local-bot', 'true');
+      // ensure not to overflow by slightly changing opacity for visual distinction
+      node.style.opacity = '0.95';
+      container.appendChild(node);
+    }
+    return true;
+  }
+
+  // Create a floating overlay panel listing the fake bots if we can't inject into real DOM
+  function createOverlayBotList(count, name) {
+    // Avoid creating multiple overlays
+    if (document.getElementById('local-bots-overlay')) return;
+    const panel = document.createElement('div');
+    panel.id = 'local-bots-overlay';
+    panel.style.position = 'fixed';
+    panel.style.right = '12px';
+    panel.style.top = '80px';
+    panel.style.zIndex = 999999;
+    panel.style.maxHeight = '70vh';
+    panel.style.overflow = 'auto';
+    panel.style.width = '220px';
+    panel.style.background = 'rgba(0,0,0,0.65)';
+    panel.style.color = '#fff';
+    panel.style.borderRadius = '8px';
+    panel.style.padding = '8px';
+    panel.style.fontFamily = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial';
+    panel.style.fontSize = '14px';
+    panel.style.boxShadow = '0 6px 20px rgba(0,0,0,0.5)';
+    panel.innerHTML = `<div style="font-weight:600;margin-bottom:6px;text-align:center">Local Fake Bots (${count})</div>`;
+    const list = document.createElement('div');
+    for (let i = 0; i < count; i++) {
+      const row = document.createElement('div');
+      row.textContent = `${name}`;
+      row.style.padding = '6px 8px';
+      row.style.borderBottom = '1px solid rgba(255,255,255,0.06)';
+      list.appendChild(row);
+    }
+    panel.appendChild(list);
+
+    // Add a close button
+    const close = document.createElement('button');
+    close.textContent = '×';
+    close.title = 'Close overlay';
+    close.style.position = 'absolute';
+    close.style.right = '6px';
+    close.style.top = '4px';
+    close.style.background = 'transparent';
+    close.style.color = '#fff';
+    close.style.border = 'none';
+    close.style.fontSize = '18px';
+    close.style.cursor = 'pointer';
+    close.addEventListener('click', () => panel.remove());
+    panel.appendChild(close);
+
+    document.body.appendChild(panel);
+  }
+
+  // Replace any visible player name text nodes on the page with BOT_NAME (best-effort)
+  function replaceVisiblePlayerNames(name) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        const v = node.nodeValue.trim();
+        if (!v) return NodeFilter.FILTER_REJECT;
+        // Heuristic: skip long paragraphs and typical content blocks
+        if (v.length > 60) return NodeFilter.FILTER_REJECT;
+        // Skip numeric-only or punctuation-only
+        if (!/[A-Za-z0-9]/.test(v)) return NodeFilter.FILTER_REJECT;
+        // If the text looks like a single username or small label, accept
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    }, false);
+    const toReplace = [];
+    while (walker.nextNode()) toReplace.push(walker.currentNode);
+    toReplace.forEach(n => {
+      try {
+        n.nodeValue = name;
+      } catch (e) { /* ignore */ }
+    });
+  }
+
+  // Main flow
+  (async function main() {
+    // Small delay to allow SPA to render primary menu
+    setTimeout(() => {
+      replaceMenuLabels();
+    }, MENU_REPLACE_DELAY_MS);
+
+    // Auto-click Multiplayer if possible
+    setTimeout(() => {
+      const clicked = autoClickMultiplayerButton();
+      if (!clicked) console.log('[local-bots] multiplayer button not found automatically');
+    }, AUTO_CLICK_DELAY_MS);
+
+    // Observe for lobby presence
+    const start = Date.now();
+    let injected = false;
+    function tryFindAndInject() {
+      const container = findLobbyPlayerList();
+      if (container) {
+        console.log('[local-bots] lobby container detected, injecting fake players');
+        const success = injectFakePlayersInto(container, BOT_COUNT, BOT_NAME);
+        if (!success) {
+          console.log('[local-bots] injection into container failed — creating overlay');
+          createOverlayBotList(BOT_COUNT, BOT_NAME);
+        }
+        // Also replace visible player names in page
+        replaceVisiblePlayerNames(BOT_NAME);
+        injected = true;
+        return true;
+      }
+      if (Date.now() - start > LOBBY_OBSERVE_TIMEOUT) {
+        // Timeout — create overlay to guarantee user sees bots
+        console.log('[local-bots] lobby not found within timeout; creating floating overlay');
+        createOverlayBotList(BOT_COUNT, BOT_NAME);
+        replaceVisiblePlayerNames(BOT_NAME);
+        injected = true;
+        return true;
+      }
+      return false;
+    }
+
+    // Poll for lobby for a short while
+    (function pollLobby() {
+      if (injected) return;
+      if (!tryFindAndInject()) setTimeout(pollLobby, 400);
+    })();
+
+    // Additionally, observe DOM mutations to detect a lobby appearing later
+    const obs = new MutationObserver((mutations, o) => {
+      if (injected) { o.disconnect(); return; }
+      if (tryFindAndInject()) o.disconnect();
+    });
+    obs.observe(document.documentElement || document.body, {childList: true, subtree: true});
+  })();
+
+})();
